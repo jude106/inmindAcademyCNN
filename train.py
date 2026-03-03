@@ -4,7 +4,7 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 import os
@@ -15,10 +15,22 @@ from model import SimpleNet
 with open('config.yaml', 'r') as f:
     config = yaml.safe_load(f)
 
-# Standard input normalization for CIFAR-10
-transform = transforms.Compose([
-    transforms.ToTensor(), # Convert PIL image to PyTorch Tensor and normalize to [0, 1]
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # Mean and Standard Deviation of the CIFAR-10 dataset
+# CIFAR-10 specific Mean and Standard Deviation for mathematically sound normalization
+cifar10_mean = (0.4914, 0.4822, 0.4465)
+cifar10_std = (0.2023, 0.1994, 0.2010)
+
+# Training transforms: includes Data Augmentation to prevent overfitting
+transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(cifar10_mean, cifar10_std)
+])
+
+# Testing/Validation transforms: NO augmentation, just normalization
+transform_test = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(cifar10_mean, cifar10_std)
 ])
 
 def get_loaders():
@@ -26,26 +38,33 @@ def get_loaders():
     os.makedirs(config['paths']['train_dir'], exist_ok=True)
     os.makedirs(config['paths']['test_dir'], exist_ok=True)
 
-    # Load the full training set
+    # Load the base training dataset TWICE to apply different transforms
     dataset_train_full = datasets.CIFAR10(
-        root=config['paths']['train_dir'],
-        train=True,
-        download=True,
-        transform=transform
+        root=config['paths']['train_dir'], train=True, download=True, transform=transform_train
     )
-    dataset_test = datasets.CIFAR10(
-        root=config['paths']['test_dir'],
-        train=False,
-        download=True,
-        transform=transform
+    dataset_val_full = datasets.CIFAR10(
+        root=config['paths']['train_dir'], train=True, download=True, transform=transform_test
     )
 
-    # Split train into train/val (e.g., 90% train, 10% val)
+    dataset_test = datasets.CIFAR10(
+        root=config['paths']['test_dir'], train=False, download=True, transform=transform_test
+    )
+
+    # Calculate split sizes
     val_split = config['hyperparameters'].get('val_split', 0.1)
     n_total = len(dataset_train_full)
     n_val = int(n_total * val_split)
-    n_train = n_total - n_val
-    dataset_train, dataset_val = random_split(dataset_train_full, [n_train, n_val])
+
+    # Create fixed indices for a clean train/val split
+    # Using a generator with a fixed seed ensures reproducibility if you restart training
+    generator = torch.Generator().manual_seed(42)
+    indices = torch.randperm(n_total, generator=generator).tolist()
+    train_idx = indices[:-n_val]
+    val_idx = indices[-n_val:]
+
+    # Map the subsets to the correctly transformed datasets
+    dataset_train = Subset(dataset_train_full, train_idx)
+    dataset_val = Subset(dataset_val_full, val_idx)
 
     dataloader_train = DataLoader(
         dataset_train,
@@ -56,7 +75,7 @@ def get_loaders():
     dataloader_val = DataLoader(
         dataset_val,
         batch_size=config['hyperparameters']['batch_size'],
-        shuffle=False,
+        shuffle=False,  # No need to shuffle validation data
         num_workers=config['hyperparameters']['num_workers']
     )
     dataloader_test = DataLoader(
@@ -87,7 +106,7 @@ def evaluate(model, dataloader, criterion, device):
     return avg_loss, accuracy
 
 
-def train(model, dataloader_train, dataloader_val, criterion, optimizer, device):
+def train(model, dataloader_train, dataloader_val, criterion, optimizer, scheduler, device):
     model.train()
     epochs = config['hyperparameters']['epochs']
     for epoch in range(epochs):
@@ -105,12 +124,20 @@ def train(model, dataloader_train, dataloader_val, criterion, optimizer, device)
                 loss = criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
+                
+                # ---> ONE CYCLE POLICY: Step the scheduler AFTER EVERY BATCH <---
+                scheduler.step()
+                
                 running_loss += loss.item()
                 avg_loss = running_loss / (i + 1)
                 progress_bar.set_postfix({'loss': avg_loss})
+        
         avg_train_loss = running_loss / len(dataloader_train)
         val_loss, val_acc = evaluate(model, dataloader_val, criterion, device)
-        print(f"Epoch {epoch+1} finished. Train loss: {avg_train_loss:.3f} | Val loss: {val_loss:.3f} | Val acc: {val_acc:.2f}%")
+        
+        # Get current learning rate to monitor the One Cycle curve
+        current_lr = scheduler.get_last_lr()[0]
+        print(f"Epoch {epoch+1} finished. Train loss: {avg_train_loss:.3f} | Val loss: {val_loss:.3f} | Val acc: {val_acc:.2f}% | LR: {current_lr:.6f}")
     print('Finished Training')
 
 
@@ -144,14 +171,26 @@ def main():
     # Define the loss function (cross-entropy for classification)
     criterion = nn.CrossEntropyLoss()
 
-    # Define the optimizer (SGD with learning rate and momentum from config)
-    optimizer = optim.SGD(
+    # Define the optimizer
+    optimizer = optim.AdamW(
         model.parameters(),
-        lr=config['hyperparameters']['lr'],
-        momentum=config['hyperparameters']['momentum']
+        lr=config['hyperparameters']['lr'], # This gets overridden by OneCycleLR
+        weight_decay=config['hyperparameters'].get('weight_decay', 0.01)
     )
 
-    train(model, dataloader_train, dataloader_val, criterion, optimizer, device)
+    # ---> Define the One Cycle Learning Rate Scheduler for Super-Convergence <---
+    epochs = config['hyperparameters']['epochs']
+    steps_per_epoch = len(dataloader_train)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=config['hyperparameters']['lr'], 
+        epochs=epochs, 
+        steps_per_epoch=steps_per_epoch
+    )
+
+    # Pass the scheduler to the train function
+    train(model, dataloader_train, dataloader_val, criterion, optimizer, scheduler, device)
+    
     test_loss, test_acc = evaluate(model, dataloader_test, criterion, device)
     print(f'Test loss: {test_loss:.3f} | Test acc: {test_acc:.2f}%')
 
