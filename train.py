@@ -23,7 +23,12 @@ cifar10_std = (0.2023, 0.1994, 0.2010)
 transform_train = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
     transforms.RandomHorizontalFlip(),
+    # ---> STATE OF THE ART AUGMENTATION <---
+    # Automatically applies a randomized mix of extreme distortions
+    transforms.TrivialAugmentWide(),
     transforms.ToTensor(),
+    # ---> THE SECRET WEAPON: CUTOUT / RANDOM ERASING <---
+    transforms.RandomErasing(p=0.5, scale=(0.05, 0.2)),
     transforms.Normalize(cifar10_mean, cifar10_std)
 ])
 
@@ -56,7 +61,6 @@ def get_loaders():
     n_val = int(n_total * val_split)
 
     # Create fixed indices for a clean train/val split
-    # Using a generator with a fixed seed ensures reproducibility if you restart training
     generator = torch.Generator().manual_seed(42)
     indices = torch.randperm(n_total, generator=generator).tolist()
     train_idx = indices[:-n_val]
@@ -168,8 +172,9 @@ def main():
     # Create the neural network and move it to the selected device
     model = SimpleNet().to(device)
 
-    # Define the loss function (cross-entropy for classification)
-    criterion = nn.CrossEntropyLoss()
+    # ---> LABEL SMOOTHING <---
+    # Prevents overconfidence by making the target 90% instead of 100%
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     # Define the optimizer
     optimizer = optim.AdamW(

@@ -18,7 +18,7 @@ class ConvBlock(nn.Module):
         return self.block(x)
 
 # ResNet-9: Optimized for fast, high-accuracy training on CIFAR-10
-class SimpleNet(nn.Module): # Kept the same class name so train.py doesn't break
+class SimpleNet(nn.Module):
     def __init__(self, in_channels=3, num_classes=10):
         super().__init__()
         
